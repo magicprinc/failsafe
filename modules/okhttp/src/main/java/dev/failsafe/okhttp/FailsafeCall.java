@@ -15,7 +15,12 @@
  */
 package dev.failsafe.okhttp;
 
-import dev.failsafe.*;
+import dev.failsafe.Call;
+import dev.failsafe.ExecutionContext;
+import dev.failsafe.Failsafe;
+import dev.failsafe.FailsafeException;
+import dev.failsafe.FailsafeExecutor;
+import dev.failsafe.Policy;
 import dev.failsafe.internal.util.Assert;
 import okhttp3.Callback;
 import okhttp3.Response;
@@ -35,8 +40,8 @@ public final class FailsafeCall {
 
   private volatile Call<Response> failsafeCall;
   private volatile CompletableFuture<Response> failsafeFuture;
-  private AtomicBoolean cancelled = new AtomicBoolean();
-  private AtomicBoolean executed = new AtomicBoolean();
+  private final AtomicBoolean cancelled = new AtomicBoolean();
+  private final AtomicBoolean executed = new AtomicBoolean();
 
   private FailsafeCall(FailsafeExecutor<Response> failsafe, okhttp3.Call call) {
     this.failsafe = failsafe;
@@ -138,21 +143,47 @@ public final class FailsafeCall {
       return result;
     }
 
-    failsafeFuture = failsafe.getAsyncExecution(exec -> {
-      prepareCall(exec).enqueue(new Callback() {
-        @Override
-        public void onResponse(okhttp3.Call call, Response response) {
-          exec.recordResult(response);
-        }
+    failsafeFuture = failsafe.getAsyncExecution(exec ->
+        prepareCall(exec).enqueue(new Callback() {
+      @Override
+      public void onResponse(okhttp3.Call call, Response response) {
+        exec.recordResult(response);
+      }
 
-        @Override
-        public void onFailure(okhttp3.Call call, IOException e) {
-          exec.recordException(e);
-        }
-      });
-    });
+      @Override
+      public void onFailure(okhttp3.Call call, IOException e) {
+        exec.recordException(e);
+      }
+    }));
 
     return failsafeFuture;
+  }
+
+  /** [OkHttp Callback to JDK CompletableFuture]<br>
+   Helps eliminate dozens of utility classes World-wide with exactly this same method.
+   Can be the first small step towards FailSafe.
+   Returns normal JDK {@link CompletableFuture} without FailSafe policies.
+  */
+  public static CompletableFuture<Response> asPromise (okhttp3.Call call) {
+    final CompletableFuture<Response> result = new CompletableFuture<Response>(){
+      @Override public boolean cancel(boolean mayInterruptIfRunning){
+        boolean c = super.cancel(mayInterruptIfRunning);
+        call.cancel();
+        return c;
+      }
+    };
+    call.enqueue(new Callback() {
+      @Override
+      public void onResponse(okhttp3.Call call, Response response) {
+        result.complete(response);
+      }
+
+      @Override
+      public void onFailure(okhttp3.Call call, IOException e) {
+        result.completeExceptionally(e);
+      }
+    });
+    return result;
   }
 
   /**

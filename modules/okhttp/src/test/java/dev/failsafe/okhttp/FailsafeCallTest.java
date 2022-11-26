@@ -16,10 +16,20 @@
 package dev.failsafe.okhttp;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
-import dev.failsafe.*;
+import dev.failsafe.CircuitBreaker;
+import dev.failsafe.CircuitBreakerOpenException;
+import dev.failsafe.Failsafe;
+import dev.failsafe.FailsafeExecutor;
+import dev.failsafe.Fallback;
+import dev.failsafe.RetryPolicy;
+import dev.failsafe.Timeout;
+import dev.failsafe.TimeoutExceededException;
 import dev.failsafe.okhttp.testing.OkHttpTesting;
 import okhttp3.Call;
-import okhttp3.*;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
@@ -27,9 +37,17 @@ import org.testng.annotations.Test;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 
-import static com.github.tomakehurst.wiremock.client.WireMock.*;
+import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.get;
+import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.stubFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
+import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
+import static com.github.tomakehurst.wiremock.client.WireMock.verify;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertTrue;
 
@@ -223,5 +241,25 @@ public class FailsafeCallTest extends OkHttpTesting {
 
   private void assertCalled(String url, int times) {
     verify(times, getRequestedFor(urlPathEqualTo(url)));
+  }
+
+
+  public void testAsPromise() throws ExecutionException, InterruptedException{
+    mockResponse(200, "foo");
+    {
+      Call call1 = callFor("/testcf1");
+      CompletableFuture<Response> cf1 = FailsafeCall.asPromise(call1);
+      cf1.cancel(true);
+      assertTrue(call1.isCanceled());
+      assertTrue(cf1.isCancelled());
+
+      assertCalled("/testcf1", 0);
+    }
+    {
+      Call call = callFor("/testcf2");
+      CompletableFuture<Response> cf = FailsafeCall.asPromise(call);
+      Response response = cf.get();//blocking wait
+      assertCalled("/testcf2", 1);
+    }
   }
 }
