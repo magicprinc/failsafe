@@ -155,8 +155,10 @@ public class DelegatingSchedulerTest {
       assertEquals(e.toString(), "java.io.IOException: OK! fail 2 fast");
     }
     assertTrue(sf2.isDone());
+    assertFalse(sf2.isCancelled());
     Thread.sleep(2500);//3-1 = 2 for slow sf1
     assertTrue(sf1.isDone());
+    assertFalse(sf1.isCancelled());
 
     try {
       sf1.get();

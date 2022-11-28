@@ -18,8 +18,9 @@ package dev.failsafe.internal.util;
 import dev.failsafe.spi.Scheduler;
 
 import java.util.concurrent.Callable;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.Delayed;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.Future;
@@ -28,6 +29,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static java.util.concurrent.ForkJoinPool.commonPool;
 
@@ -113,11 +115,15 @@ public final class DelegatingScheduler implements Scheduler {
         null, true/*asyncMode*/);
   }
 
-  static final class ScheduledCompletableFuture<V> extends CompletableFuture<V> implements ScheduledFuture<V> {
+  private static final Object[] CANCELLED = new Object[0];
+  private static final Object[] WORKING = new Object[0];
+
+  static final class ScheduledCompletableFuture<V> implements ScheduledFuture<V> {
     // Guarded by this
     volatile Future<V> delegate;
     // Guarded by this
     Thread forkJoinPoolThread;
+    volatile Object res = WORKING;
 
     @Override
     public long getDelay(TimeUnit unit){
@@ -135,14 +141,79 @@ public final class DelegatingScheduler implements Scheduler {
 
     @Override
     public boolean cancel(boolean mayInterruptIfRunning) {
-      boolean result = super.cancel(mayInterruptIfRunning);
+      boolean result = res == CANCELLED;
       synchronized (this) {
         if (delegate != null)
-          result = delegate.cancel(mayInterruptIfRunning);
+          result = result || delegate.cancel(mayInterruptIfRunning);
         if (forkJoinPoolThread != null && mayInterruptIfRunning)
           forkJoinPoolThread.interrupt();
+        if (result)
+          res = CANCELLED;
       }
       return result;
+    }
+
+    @Override public boolean isCancelled(){
+      final Future<V> f = delegate;
+      final Object r = res;
+      return (r == CANCELLED) || (f != null && f.isCancelled());
+    }
+
+    @Override public boolean isDone(){
+      final Future<V> f = delegate;
+      final Object r = res;
+      return (r == CANCELLED) || (f != null && f.isCancelled()) || (f != null && f.isDone());
+    }
+
+    @Override @SuppressWarnings("unchecked")
+    public V get() throws InterruptedException, ExecutionException{
+      if (res == WORKING) {
+        Future<?> f = delegate;
+        if (f != null)
+          f.get();// returns null, but we need not result, but blocking wait
+        // 2nd executor
+        if (res == WORKING) {
+          f = delegate;
+          if (f != null)
+            f.get();
+        }
+      }
+      Object r = res;
+      if (r == CANCELLED || r instanceof CancellationException)
+        throw new CancellationException();
+      if (r instanceof Throwable) // Throwable could be good result, see Alt in CF
+        throw new ExecutionException((Throwable) r);
+      return (V) r;
+    }
+
+    @Override @SuppressWarnings("unchecked")
+    public V get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException{
+      if (res == WORKING) {
+        Future<?> f = delegate;
+        if (f != null)
+          f.get(timeout,unit);// returns null, but we need not result, but blocking wait
+        // 2nd executor
+        if (res == WORKING) {
+          f = delegate;
+          if (f != null)
+            f.get(timeout,unit);
+        }
+      }
+      Object r = res;
+      if (r == CANCELLED || r instanceof CancellationException)
+        throw new CancellationException();
+      if (r instanceof Throwable) // Throwable could be good result, see Alt in CF
+        throw new ExecutionException((Throwable) r);
+      return (V) r;
+    }
+
+    public void complete(Object complete){
+      res = complete;// good result is above all principles :-)
+    }
+
+    public void completeExceptionally(Throwable ex){
+      if (res == WORKING)// not completed, not canceled
+        res = ex;
     }
   }//ScheduledCompletableFuture
 
@@ -156,7 +227,7 @@ public final class DelegatingScheduler implements Scheduler {
         : LazyForkJoinPoolHolder.FORK_JOIN_POOL;
   }
 
-  @Override @SuppressWarnings({ "unchecked", "rawtypes" })
+  @Override @SuppressWarnings({"rawtypes"})
   public ScheduledFuture<?> schedule(Callable<?> callable, long delay, TimeUnit unit) {
     ScheduledCompletableFuture promise = new ScheduledCompletableFuture<>();
     final Callable<?> completingCallable = (executorType & EX_FORK_JOIN) == EX_FORK_JOIN
