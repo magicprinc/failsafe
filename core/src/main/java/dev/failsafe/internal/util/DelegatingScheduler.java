@@ -115,19 +115,17 @@ public final class DelegatingScheduler implements Scheduler {
         null, true/*asyncMode*/);
   }
 
-  private static final Object[] CANCELLED = new Object[0];
-  private static final Object[] WORKING = new Object[0];
-
   static class ScheduledCompletableFuture<V> implements ScheduledFuture<V>, Callable<V>{
     // Guarded by this
     volatile Future<V> delegate;
     // Guarded by this
     Thread forkJoinPoolThread;
-    volatile Object res = WORKING;
+    volatile Object res;
     final Callable<?> callable;
 
     public ScheduledCompletableFuture(Callable<?> callable){
       this.callable = callable;
+      res = this; // WORKING
     }
 
     @Override public long getDelay(TimeUnit unit){
@@ -144,70 +142,76 @@ public final class DelegatingScheduler implements Scheduler {
     }
 
     @Override
-    public boolean cancel(boolean mayInterruptIfRunning) {
-      boolean result = res == CANCELLED;
-      synchronized (this) {
-        if (delegate != null)
-          result = result || delegate.cancel(mayInterruptIfRunning);
-        if (forkJoinPoolThread != null && mayInterruptIfRunning)
-          forkJoinPoolThread.interrupt();
-        if (result)
-          res = CANCELLED;
+    public synchronized boolean cancel(boolean mayInterruptIfRunning) {
+      boolean result = res instanceof CancellationException;
+
+      if (delegate != null)
+        result |= delegate.cancel(mayInterruptIfRunning);
+
+      if (forkJoinPoolThread != null && mayInterruptIfRunning)
+        forkJoinPoolThread.interrupt();
+
+      if (result) {
+        if (!(res instanceof CancellationException) && (res == this)) {
+          res = new CancellationException();
+        }
       }
       return result;
     }
 
     @Override public boolean isCancelled(){
       final Future<V> f = delegate;
-      final Object r = res;
-      return (r == CANCELLED) || (f != null && f.isCancelled());
+      return (res instanceof CancellationException)
+          || (f != null && f.isCancelled());
     }
 
     @Override public boolean isDone(){
       final Future<V> f = delegate;
-      final Object r = res;
-      return (r == CANCELLED) || (f != null && f.isCancelled()) || (f != null && f.isDone());
+      return (res instanceof CancellationException)
+          || res != this
+          || (f != null && f.isCancelled())
+          || (f != null && f.isDone());
     }
 
     @Override @SuppressWarnings("unchecked")
     public V get() throws InterruptedException, ExecutionException{
-      if (res == WORKING) {
+      if (res == this) {// WORKING
         Future<?> f = delegate;
         if (f != null)
           f.get();// returns null, but we need not result, but blocking wait
         // 2nd executor
-        if (res == WORKING) {
+        if (res == this) {// WORKING
           f = delegate;
           if (f != null)
             f.get();
         }
       }
       Object r = res;
-      if (r == CANCELLED || r instanceof CancellationException)
-        throw new CancellationException();
-      if (r instanceof Throwable) // Throwable could be good result, see Alt in CF
-        throw new ExecutionException((Throwable) r);
+      if (r instanceof CancellationException)
+        throw (CancellationException) r;
+      if (r instanceof ExecutionException)
+        throw (ExecutionException) r;
       return (V) r;
     }
 
     @Override @SuppressWarnings("unchecked")
     public V get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException{
-      if (res == WORKING) {
+      if (res == this) {// WORKING
         Future<?> f = delegate;
         if (f != null)
           f.get(timeout,unit);// returns null, but we need not result, but blocking wait
         // 2nd executor
-        if (res == WORKING) {
+        if (res == this) {// WORKING
           f = delegate;
           if (f != null)
             f.get(timeout,unit);
         }
       }
       Object r = res;
-      if (r == CANCELLED || r instanceof CancellationException)
-        throw new CancellationException();
-      if (r instanceof Throwable) // Throwable could be good result, see Alt in CF
-        throw new ExecutionException((Throwable) r);
+      if (r instanceof CancellationException)
+        throw (CancellationException) r;
+      if (r instanceof ExecutionException)
+        throw (ExecutionException) r;
       return (V) r;
     }
 
@@ -218,9 +222,18 @@ public final class DelegatingScheduler implements Scheduler {
       try {
         before();
         res = callable.call(); // good result is above all principles :-)
-      } catch (Throwable ex) {
-        if (res == WORKING)// not completed, not canceled
-          res = ex;
+      } catch (Throwable e) {
+        if (res == this) {//WORKING: not completed, not canceled
+          if (e instanceof CancellationException || e instanceof ExecutionException) {
+            res = e;// as is
+          } else if (e instanceof InterruptedException) {
+            CancellationException tmp = new CancellationException();
+            tmp.initCause(e);
+            res = tmp;
+          } else {
+            res = new ExecutionException(e);
+          }
+        }
       } finally {
         after();
       }
