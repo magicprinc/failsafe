@@ -47,7 +47,7 @@ import static java.util.concurrent.ForkJoinPool.commonPool;
  * @author Ben Manes
  */
 public final class DelegatingScheduler implements Scheduler {
-  public static final DelegatingScheduler INSTANCE = new DelegatingScheduler();
+  public static final DelegatingScheduler INSTANCE = new DelegatingScheduler(null, false);
 
   private final ExecutorService executorService;
   private final int executorType;
@@ -57,10 +57,6 @@ public final class DelegatingScheduler implements Scheduler {
   private static final int EX_COMMON    = 4;
   private static final int EX_INTERNAL  = 8;
 
-
-  private DelegatingScheduler() {
-    this(null, false);
-  }
 
   public DelegatingScheduler(ExecutorService executor) {
     this(executor, false);
@@ -111,8 +107,7 @@ public final class DelegatingScheduler implements Scheduler {
   private static final class LazyForkJoinPoolHolder {
     private static final ForkJoinPool FORK_JOIN_POOL = new ForkJoinPool(
         Math.max(Runtime.getRuntime().availableProcessors(), 2),
-        ForkJoinPool.defaultForkJoinWorkerThreadFactory,
-        null, true/*asyncMode*/);
+        ForkJoinPool.defaultForkJoinWorkerThreadFactory, null, true/*asyncMode*/);
   }
 
   static class ScheduledCompletableFuture<V> implements ScheduledFuture<V>, Callable<V>{
@@ -134,9 +129,8 @@ public final class DelegatingScheduler implements Scheduler {
           : 0; // we are executed now
     }
 
-    @Override
-    public int compareTo(Delayed other) {
-      if (other == this)// ScheduledFuture<?> gives no extra info
+    @Override public int compareTo(Delayed other) {
+      if (other == this)// ScheduledFuture<?> gives no extra info. [i] This method is not actually used.
         return 0;
       return Long.compare(getDelay(TimeUnit.NANOSECONDS), other.getDelay(TimeUnit.NANOSECONDS));
     }
@@ -173,8 +167,7 @@ public final class DelegatingScheduler implements Scheduler {
           || (f != null && f.isDone());
     }
 
-    @Override @SuppressWarnings("unchecked")
-    public V get() throws InterruptedException, ExecutionException{
+    @Override public V get() throws InterruptedException, ExecutionException{
       if (res == this) {// WORKING
         Future<?> f = delegate;
         if (f != null)
@@ -186,15 +179,21 @@ public final class DelegatingScheduler implements Scheduler {
             f.get();
         }
       }
+      return reportGet();
+    }
+
+    @SuppressWarnings("unchecked")
+    protected V reportGet () throws ExecutionException, CancellationException {
       Object r = res;
       if (r instanceof CancellationException)
         throw (CancellationException) r;
       if (r instanceof ExecutionException)
         throw (ExecutionException) r;
-      return (V) r;
+      return r != this ? (V) r
+          : null;// can't be
     }
 
-    @Override @SuppressWarnings("unchecked")
+    @Override
     public V get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException{
       if (res == this) {// WORKING
         Future<?> f = delegate;
@@ -207,12 +206,7 @@ public final class DelegatingScheduler implements Scheduler {
             f.get(timeout,unit);
         }
       }
-      Object r = res;
-      if (r instanceof CancellationException)
-        throw (CancellationException) r;
-      if (r instanceof ExecutionException)
-        throw (ExecutionException) r;
-      return (V) r;
+      return reportGet();
     }
 
     protected void before () {}
@@ -224,7 +218,7 @@ public final class DelegatingScheduler implements Scheduler {
         res = callable.call(); // good result is above all principles :-)
       } catch (Throwable e) {
         if (res == this) {//WORKING: not completed, not canceled
-          if (e instanceof CancellationException || e instanceof ExecutionException) {
+          if (e instanceof CancellationException || e instanceof ExecutionException){// Error? CompletionException?
             res = e;// as is
           } else if (e instanceof InterruptedException) {
             CancellationException tmp = new CancellationException();
@@ -239,22 +233,28 @@ public final class DelegatingScheduler implements Scheduler {
       }
       return null;
     }
+    /** Transfer this Callable to final "real" ExecutorService.
+     synchronized - Guard against race with promise.cancel.
+     todo If executor rejects the task and is not shutdown: retry later */
+    protected synchronized V transferTo (ExecutorService finalExecutor) {
+      if (!isCancelled())
+        delegate = finalExecutor.submit(this);
+      return null;
+    }
   }//ScheduledCompletableFuture
 
   static class ScheduledCompletableFutureFJ<V> extends ScheduledCompletableFuture<V> {
     public ScheduledCompletableFutureFJ(Callable<V> callable){
       super(callable);
     }
-
     @Override protected synchronized void before(){
-      // Guard against race with promise.cancel
+      // synchronized^: Guard against race with promise.cancel
       forkJoinPoolThread = Thread.currentThread();
     }
-
     @Override protected synchronized void after(){
       forkJoinPoolThread = null;
     }
-  }
+  }//ScheduledCompletableFutureFJ
 
   private ScheduledExecutorService delayer() {
     return ((executorType & EX_SCHEDULED) == EX_SCHEDULED) ? (ScheduledExecutorService) executorService()
@@ -272,40 +272,18 @@ public final class DelegatingScheduler implements Scheduler {
         ? new ScheduledCompletableFutureFJ(callable)
         : new ScheduledCompletableFuture(callable);
 
-    if (delay <= 0) {
+    if (delay <= 0) {// time is out: submit direct into target executor
       promise.delegate = executorService().submit(promise);
-      return promise;
+
+    } else {// use less memory: don't capture variable with commonPool; don't wrap Runnable in Callable
+      Callable<?> r = ( executorType & EX_COMMON ) == EX_COMMON
+          ? ()->promise.transferTo(commonPool())
+          : (executorType & EX_INTERNAL) == EX_INTERNAL
+              ? ()->promise.transferTo(LazyForkJoinPoolHolder.FORK_JOIN_POOL)
+              : ()->promise.transferTo(executorService());
+
+      promise.delegate = delayer().schedule(r, delay, unit);
     }
-    final ExecutorService es = executorService();
-    final Runnable r;// use less memory: don't capture variable with commonPool
-
-    if ((executorType & EX_COMMON) == EX_COMMON)
-      r = ()->{
-        // Guard against race with promise.cancel
-        synchronized(promise) {
-          if (!promise.isCancelled())
-            promise.delegate = commonPool().submit(promise);
-        }
-      };
-
-    else if ((executorType & EX_INTERNAL) == EX_INTERNAL)
-      r = ()->{
-        // Guard against race with promise.cancel
-        synchronized(promise) {
-          if (!promise.isCancelled())
-            promise.delegate = LazyForkJoinPoolHolder.FORK_JOIN_POOL.submit(promise);
-        }
-      };
-
-    else
-      r = ()->{
-        // Guard against race with promise.cancel
-        synchronized(promise) {
-          if (!promise.isCancelled())
-            promise.delegate = es.submit(promise);
-        }
-      };
-    promise.delegate = delayer().schedule(r, delay, unit);
     return promise;
   }
 }
