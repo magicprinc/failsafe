@@ -37,6 +37,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertNull;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.expectThrows;
 import static org.testng.Assert.fail;
@@ -119,6 +120,7 @@ public class DelegatingSchedulerTest {
     } catch (Throwable e) {
       assertEquals(e.toString(), "java.io.IOException: OK! testInternalPool");
     }
+    Thread.sleep(100);// Waiter is too fast :-)
     assertTrue(sf.isDone());
 
     try {
@@ -128,6 +130,32 @@ public class DelegatingSchedulerTest {
       assertEquals(e.toString(), "java.util.concurrent.ExecutionException: java.io.IOException: OK! testInternalPool");
     }
   }
+  /** Internal Pool without flag = as if = external ExecutorService */
+  public void testInternalPool2() throws TimeoutException, ExecutionException, InterruptedException{
+    DelegatingScheduler ds = new DelegatingScheduler((byte) 0);// "external"
+    Waiter waiter = new Waiter();
+
+    ScheduledFuture<?> sf = ds.schedule(()->{
+      waiter.rethrow(new IOException("OK! testInternalPool"));
+      return 42;
+    }, 5, MILLISECONDS);
+
+    try {
+      waiter.await(1000);
+      fail();
+    } catch (Throwable e) {
+      assertEquals(e.toString(), "java.io.IOException: OK! testInternalPool");
+    }
+    assertTrue(sf.isDone());
+
+    try {
+      sf.get();
+      fail();
+    } catch (ExecutionException e) {
+      assertEquals(e.toString(), "java.util.concurrent.ExecutionException: java.io.IOException: OK! testInternalPool");
+    }
+  }
+
 
   @Test
   public void testExternalScheduler() throws TimeoutException, ExecutionException, InterruptedException{
@@ -149,10 +177,10 @@ public class DelegatingSchedulerTest {
     assertTrue(sf1.getDelay(MILLISECONDS) > 2000);
 
     try {
-      waiter.await(3200);
+      waiter.await(1500);// sf2 ~ 1s+
       fail();
     } catch (Throwable e) {
-      assertEquals(e.toString(), "java.io.IOException: OK! fail 2 fast");
+      assertEquals(e.toString(), "java.io.IOException: OK! fail 2 fast", e.toString());
     }
     assertTrue(sf2.isDone());
     assertFalse(sf2.isCancelled());
@@ -263,6 +291,112 @@ public class DelegatingSchedulerTest {
     assertTrue(task1.isCompletedAbnormally());
     assertTrue(task1.isCancelled());
     assertTrue(task2.isCancelled());
+  }
+
+  public void testWaitTwice () throws TimeoutException, ExecutionException, InterruptedException{
+    DelegatingScheduler ds = new DelegatingScheduler((byte) 0);
+
+    long t = System.nanoTime();
+    DelegatingScheduler.ScheduledCompletableFuture<?> sf = (DelegatingScheduler.ScheduledCompletableFuture<?>)
+        ds.schedule(()->
+    {
+      Thread.sleep(1000);
+      return 42;
+    }, 500, MILLISECONDS);// 500 + 1000 = min 1500ms
+
+    assertEquals(sf.get(), 42);
+    assertTrue(sf.isDone());
+    assertFalse(sf.isCancelled());
+    t = (System.nanoTime() - t)/1_000_000;//to millis
+    assertTrue(t >= 1500);
+
+    assertTrue(sf.delegate instanceof ForkJoinTask);
+    assertTrue(sf.delegate.isDone());
+    assertNull(sf.delegate.get());
+  }
+
+  public void testWaitTwiceWithTimeout1ok () throws TimeoutException, ExecutionException, InterruptedException{
+    DelegatingScheduler ds = new DelegatingScheduler((byte) 0);
+
+    long t = System.nanoTime();
+    ScheduledFuture<?> sf = ds.schedule(()->{
+      Thread.sleep(1000);
+      return 42;
+    }, 500, MILLISECONDS);
+
+    assertEquals(sf.get(1700, MILLISECONDS), 42);
+    assertTrue(sf.isDone());
+    assertFalse(sf.isCancelled());
+    t = (System.nanoTime() - t)/1_000_000;//to millis
+    assertTrue(t >= 1500);
+  }
+
+  public void testWaitTwiceWithTimeout2 () throws ExecutionException, InterruptedException{
+    DelegatingScheduler ds = new DelegatingScheduler((byte) 0);
+
+    long t = System.nanoTime();
+    ScheduledFuture<?> sf = ds.schedule(()->{
+      Thread.sleep(5000);
+      return 42;
+    }, 500, MILLISECONDS);
+
+    try {
+      sf.get(100, MILLISECONDS);// Timeout in Scheduled
+      fail();
+    } catch (TimeoutException e) {
+      assertEquals(e.toString(), "java.util.concurrent.TimeoutException");
+    }
+    assertTrue(((DelegatingScheduler.ScheduledCompletableFuture<?>)sf).delegate instanceof RunnableScheduledFuture);
+    assertFalse(sf.isDone());
+    assertFalse(sf.isCancelled());
+    t = (System.nanoTime() - t)/1_000_000;//to millis
+    assertTrue(t > 100 && t < 500);
+    assertEquals(sf.get(), 42);
+    assertTrue(sf.isDone());
+    assertFalse(sf.isCancelled());
+  }
+
+  public void testWaitTwiceWithTimeout3 () throws TimeoutException, ExecutionException, InterruptedException{
+    DelegatingScheduler ds = new DelegatingScheduler((byte) 0);
+
+    long t = System.nanoTime();
+    ScheduledFuture<?> sf = ds.schedule(()->{
+      Thread.sleep(1500);
+      return 42;
+    }, 300, MILLISECONDS);
+
+    try {
+      sf.get(900, MILLISECONDS);// Timeout in target executor
+    } catch (TimeoutException e) {
+      assertEquals(e.toString(), "java.util.concurrent.TimeoutException");
+    }
+    assertTrue(((DelegatingScheduler.ScheduledCompletableFuture<?>)sf).delegate instanceof ForkJoinTask);
+    assertFalse(sf.isDone());
+    assertFalse(sf.isCancelled());
+    t = (System.nanoTime() - t)/1_000_000;//to millis
+    assertTrue(t >= 900 && t < 1500);
+    assertEquals(sf.get(), 42);
+    assertTrue(sf.isDone());
+    assertFalse(sf.isCancelled());
+  }
+
+  public void testDontWrapIfSpectial () throws TimeoutException, InterruptedException{
+    DelegatingScheduler ds = new DelegatingScheduler((byte) 0);
+
+    ScheduledFuture<?> sf = ds.schedule(()-> {
+      Thread.sleep(500);
+      throw new ExecutionException("It's me", new IOException("fake"));
+    }, 100, MILLISECONDS);
+
+    try {
+      sf.get();
+      fail();
+    } catch (ExecutionException e) {
+      assertEquals(e.toString(), "java.util.concurrent.ExecutionException: It's me", e.toString());
+      assertEquals(e.getCause().toString(), "java.io.IOException: fake", e.getCause().toString());
+    }
+    assertTrue(sf.isDone());
+    assertFalse(sf.isCancelled());
   }
 
 }

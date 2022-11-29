@@ -55,7 +55,6 @@ public final class DelegatingScheduler implements Scheduler {
   private static final int EX_COMMON    = 4;
   private static final int EX_INTERNAL  = 8;
 
-
   public DelegatingScheduler(ExecutorService executor) {
     this(executor, false);
   }
@@ -132,8 +131,7 @@ public final class DelegatingScheduler implements Scheduler {
       return Long.compare(getDelay(TimeUnit.NANOSECONDS), other.getDelay(TimeUnit.NANOSECONDS));
     }
 
-    @Override
-    public synchronized boolean cancel(boolean mayInterruptIfRunning) {
+    @Override public synchronized boolean cancel(boolean mayInterruptIfRunning) {
       if (res == this)// Working: not canceled, not done
         res = new CancellationException("cancel("+mayInterruptIfRunning+')');
 
