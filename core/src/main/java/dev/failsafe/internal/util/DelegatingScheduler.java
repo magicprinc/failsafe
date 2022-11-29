@@ -45,43 +45,40 @@ import java.util.concurrent.TimeoutException;
  * @author Ben Manes
  */
 public final class DelegatingScheduler implements Scheduler {
-  public static final DelegatingScheduler INSTANCE = new DelegatingScheduler(null, false);
+  public static final DelegatingScheduler INSTANCE = new DelegatingScheduler(null, null);
 
   private final ExecutorService executorService;
+  private final ScheduledExecutorService scheduler;
   private final int executorType;
 
   private static final int EX_FORK_JOIN = 1;
-  private static final int EX_SCHEDULED = 2;
   private static final int EX_COMMON    = 4;
   private static final int EX_INTERNAL  = 8;
 
   public DelegatingScheduler(ExecutorService executor) {
-    this(executor, false);
+    this(executor, null);
   }
 
-  public DelegatingScheduler(ExecutorService executor, boolean canUseScheduledExecutorService) {
-    final int type;
+  public DelegatingScheduler(ExecutorService executor, ScheduledExecutorService scheduler) {
     if (executor == null || executor == ForkJoinPool.commonPool()) {
       if (ForkJoinPool.getCommonPoolParallelism() > 1) {// @see CompletableFuture#useCommonPool
         executorService = ForkJoinPool.commonPool();
-        type = EX_COMMON   | EX_FORK_JOIN;
+        executorType = EX_COMMON   | EX_FORK_JOIN;
 
       } else {// don't use commonPool(): cannot support parallelism
         executorService = null;
-        type = EX_INTERNAL | EX_FORK_JOIN;
+        executorType = EX_INTERNAL | EX_FORK_JOIN;
       }
     } else {
       executorService = executor;
-      type = executor instanceof ForkJoinPool ? EX_FORK_JOIN
+      executorType = executor instanceof ForkJoinPool ? EX_FORK_JOIN
           : 0;
     }
-    executorType = canUseScheduledExecutorService && executorService instanceof ScheduledExecutorService
-        ? type | EX_SCHEDULED
-        : type;
+    this.scheduler = scheduler;
   }
 
   DelegatingScheduler (byte flags) {
-    executorService = null;  executorType = flags;
+    executorService = null;  executorType = flags;  scheduler = null;
   }//new for tests
 
   private static final class LazyDelayerHolder extends ScheduledThreadPoolExecutor implements ThreadFactory {
@@ -249,7 +246,7 @@ public final class DelegatingScheduler implements Scheduler {
   }//ScheduledCompletableFutureFJ
 
   private ScheduledExecutorService delayer() {
-    return ((executorType & EX_SCHEDULED) == EX_SCHEDULED) ? (ScheduledExecutorService) executorService()
+    return scheduler != null ? scheduler
         : LazyDelayerHolder.DELAYER;
   }
 

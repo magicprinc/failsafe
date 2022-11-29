@@ -22,6 +22,7 @@ import org.testng.annotations.Test;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ForkJoinPool;
@@ -160,7 +161,7 @@ public class DelegatingSchedulerTest {
   @Test
   public void testExternalScheduler() throws TimeoutException, ExecutionException, InterruptedException{
     ScheduledThreadPoolExecutor stpe = new ScheduledThreadPoolExecutor(1);
-    DelegatingScheduler ds = new DelegatingScheduler(stpe, true);
+    DelegatingScheduler ds = new DelegatingScheduler(stpe, stpe);
 
     Waiter waiter = new Waiter();
 
@@ -399,4 +400,56 @@ public class DelegatingSchedulerTest {
     assertFalse(sf.isCancelled());
   }
 
+
+  @Test public void testUsedMemory() throws ExecutionException, InterruptedException, TimeoutException{
+    { Runtime rt = Runtime.getRuntime();
+    rt.gc(); rt.gc(); rt.gc();
+    Thread.sleep(5000); }
+    final long usedMemory0 = getUsedMemory();
+
+    final int MAX = 10_000_000;
+    final int TIMEOUT = 7_000;
+
+    ScheduledThreadPoolExecutor es = new ScheduledThreadPoolExecutor(100);//to control queue
+    DelegatingScheduler ds = new DelegatingScheduler(null/*main common pool*/, es);
+    // task is the same = constant memory
+    final Callable<Object> businessTask = ()->42;
+
+    final long deadline = System.currentTimeMillis() + TIMEOUT;
+
+    final ScheduledFuture<?> sf0 = ds.schedule(businessTask, TIMEOUT, MILLISECONDS);
+    ScheduledFuture<?> sf = null;
+    for (int i=0; i<MAX; i++){
+      sf = ds.schedule(businessTask, deadline-System.currentTimeMillis(), MILLISECONDS);
+    }
+    assertFalse(sf0.isDone());
+    assertFalse(sf0.isCancelled());
+    assertFalse(sf.isDone());
+    assertFalse(sf.isCancelled());
+
+    while (!es.getQueue().isEmpty()){
+      long usedMemory1 = getUsedMemory() - usedMemory0;
+      System.out.println(deadline-System.currentTimeMillis());
+      System.out.println("USED MEMORY = "+(usedMemory1/1024/1024.0)+" ~ "+(usedMemory1/MAX));
+      System.out.println("Q size: " + es.getQueue().size() + ", ActiveCount: "+es.getActiveCount()+
+          ", TaskCount: "+es.getTaskCount()+", PoolSize: "+es.getPoolSize());
+      Thread.sleep(2000);// don't be noisy
+    }
+
+    assertEquals(42, sf0.get());
+    assertTrue(sf0.isDone());
+    assertFalse(sf0.isCancelled());
+    assertEquals(42, sf.get());
+    assertTrue(sf.isDone());
+    assertFalse(sf.isCancelled());
+
+    long usedMemory2 = getUsedMemory() - usedMemory0;
+
+    System.out.println("USED MEMORY 2 = "+(usedMemory2/1024/1024.0)+" ~ "+(usedMemory2/MAX));
+  }
+
+  public static long getUsedMemory() {
+    Runtime runtime = Runtime.getRuntime();
+    return runtime.totalMemory() - runtime.freeMemory();
+  }
 }
