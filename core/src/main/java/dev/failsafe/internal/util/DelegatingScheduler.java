@@ -118,15 +118,19 @@ public final class DelegatingScheduler implements Scheduler {
   private static final Object[] CANCELLED = new Object[0];
   private static final Object[] WORKING = new Object[0];
 
-  static final class ScheduledCompletableFuture<V> implements ScheduledFuture<V> {
+  static class ScheduledCompletableFuture<V> implements ScheduledFuture<V>, Callable<V>{
     // Guarded by this
     volatile Future<V> delegate;
     // Guarded by this
     Thread forkJoinPoolThread;
     volatile Object res = WORKING;
+    final Callable<?> callable;
 
-    @Override
-    public long getDelay(TimeUnit unit){
+    public ScheduledCompletableFuture(Callable<?> callable){
+      this.callable = callable;
+    }
+
+    @Override public long getDelay(TimeUnit unit){
       Future<V> f = delegate;
       return f instanceof Delayed ? ((Delayed) f).getDelay(unit)
           : 0; // we are executed now
@@ -207,15 +211,37 @@ public final class DelegatingScheduler implements Scheduler {
       return (V) r;
     }
 
-    public void complete(Object complete){
-      res = complete;// good result is above all principles :-)
-    }
+    protected void before () {}
+    protected void after () {}
 
-    public void completeExceptionally(Throwable ex){
-      if (res == WORKING)// not completed, not canceled
-        res = ex;
+    @Override public V call() {
+      try {
+        before();
+        res = callable.call(); // good result is above all principles :-)
+      } catch (Throwable ex) {
+        if (res == WORKING)// not completed, not canceled
+          res = ex;
+      } finally {
+        after();
+      }
+      return null;
     }
   }//ScheduledCompletableFuture
+
+  static class ScheduledCompletableFutureFJ<V> extends ScheduledCompletableFuture<V> {
+    public ScheduledCompletableFutureFJ(Callable<V> callable){
+      super(callable);
+    }
+
+    @Override protected synchronized void before(){
+      // Guard against race with promise.cancel
+      forkJoinPoolThread = Thread.currentThread();
+    }
+
+    @Override protected synchronized void after(){
+      forkJoinPoolThread = null;
+    }
+  }
 
   private ScheduledExecutorService delayer() {
     return ((executorType & EX_SCHEDULED) == EX_SCHEDULED) ? (ScheduledExecutorService) executorService()
@@ -227,40 +253,16 @@ public final class DelegatingScheduler implements Scheduler {
         : LazyForkJoinPoolHolder.FORK_JOIN_POOL;
   }
 
-  @Override @SuppressWarnings({"rawtypes"})
+  @Override @SuppressWarnings({"rawtypes", "unchecked"})
   public ScheduledFuture<?> schedule(Callable<?> callable, long delay, TimeUnit unit) {
-    ScheduledCompletableFuture promise = new ScheduledCompletableFuture<>();
-    final Callable<?> completingCallable = (executorType & EX_FORK_JOIN) == EX_FORK_JOIN
-      ? () -> {
-        try {
-          // Guard against race with promise.cancel
-          synchronized (promise) {
-            promise.forkJoinPoolThread = Thread.currentThread();
-          }
-          promise.complete(callable.call());
-        } catch (Throwable t) {
-          promise.completeExceptionally(t);
-        } finally {
-          synchronized (promise) {
-            promise.forkJoinPoolThread = null;
-          }
-        }
-        return null;
-      }// else not ForkJoin  BTW: but why? Other ExecutorServices also support cancellation
-      : () ->{
-        try {
-          promise.complete(callable.call());
-        } catch (Throwable t) {
-          promise.completeExceptionally(t);
-        }
-        return null;
-      };
+    ScheduledCompletableFuture promise = (executorType & EX_FORK_JOIN) == EX_FORK_JOIN
+        ? new ScheduledCompletableFutureFJ(callable)
+        : new ScheduledCompletableFuture(callable);
 
     if (delay <= 0) {
-      promise.delegate = executorService().submit(completingCallable);
+      promise.delegate = executorService().submit(promise);
       return promise;
     }
-
     final ExecutorService es = executorService();
     final Runnable r;// use less memory: don't capture variable with commonPool
 
@@ -269,7 +271,7 @@ public final class DelegatingScheduler implements Scheduler {
         // Guard against race with promise.cancel
         synchronized(promise) {
           if (!promise.isCancelled())
-            promise.delegate = commonPool().submit(completingCallable);
+            promise.delegate = commonPool().submit(promise);
         }
       };
 
@@ -278,7 +280,7 @@ public final class DelegatingScheduler implements Scheduler {
         // Guard against race with promise.cancel
         synchronized(promise) {
           if (!promise.isCancelled())
-            promise.delegate = LazyForkJoinPoolHolder.FORK_JOIN_POOL.submit(completingCallable);
+            promise.delegate = LazyForkJoinPoolHolder.FORK_JOIN_POOL.submit(promise);
         }
       };
 
@@ -287,7 +289,7 @@ public final class DelegatingScheduler implements Scheduler {
         // Guard against race with promise.cancel
         synchronized(promise) {
           if (!promise.isCancelled())
-            promise.delegate = es.submit(completingCallable);
+            promise.delegate = es.submit(promise);
         }
       };
     promise.delegate = delayer().schedule(r, delay, unit);
