@@ -407,10 +407,15 @@ public class DelegatingSchedulerTest {
     Thread.sleep(5000); }
     final long usedMemory0 = getUsedMemory();
 
-    final int MAX = 10_000_000;
-    final int TIMEOUT = 7_000;
-
-    ScheduledThreadPoolExecutor es = new ScheduledThreadPoolExecutor(100);//to control queue
+    final int MAX = 5_000_000;//10m = same result
+    final int TIMEOUT = 5_000;
+    //to control queue:
+    ScheduledThreadPoolExecutor es = new ScheduledThreadPoolExecutor(1, r->{
+      Thread t = new Thread(r, "PUSHER");
+      t.setDaemon(true);
+      t.setPriority(Thread.MAX_PRIORITY);
+      return t;
+    });
     DelegatingScheduler ds = new DelegatingScheduler(null/*main common pool*/, es);
     // task is the same = constant memory
     final Callable<Object> businessTask = ()->42;
