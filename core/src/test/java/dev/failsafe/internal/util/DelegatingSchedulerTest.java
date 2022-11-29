@@ -22,9 +22,12 @@ import org.testng.annotations.Test;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.util.Collection;
+import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinTask;
 import java.util.concurrent.Future;
@@ -33,12 +36,14 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNull;
+import static org.testng.Assert.assertSame;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.expectThrows;
 import static org.testng.Assert.fail;
@@ -456,5 +461,92 @@ public class DelegatingSchedulerTest {
   public static long getUsedMemory() {
     Runtime runtime = Runtime.getRuntime();
     return runtime.totalMemory() - runtime.freeMemory();
+  }
+
+
+  @Test public void testTransferSpeed() throws InterruptedException, ExecutionException{
+    final int MAX = 5_000_000;//10m = same result
+    final int TIMEOUT = 5_000;
+    //to control queue:
+    ScheduledThreadPoolExecutor es = new ScheduledThreadPoolExecutor(1, r->{
+      Thread t = new Thread(r, "PUSHER");
+      t.setDaemon(true);
+      t.setPriority(Thread.MAX_PRIORITY);
+      return t;
+    });
+    final Future<?> DONE_FUTURE = new Future<Object>(){
+      @Override public boolean cancel (boolean mayInterruptIfRunning){ return true;}
+      @Override public boolean isCancelled (){ return false;}
+      @Override public boolean isDone (){ return true;}
+      @Override public Object get (){ return null;}
+      @Override public Object get (long timeout, TimeUnit unit){ return null;}
+    };
+    AtomicLong processed = new AtomicLong();
+    final ExecutorService main = new ExecutorService(){
+      @Override public void shutdown (){}
+      @Override public List<Runnable> shutdownNow (){ return null;}
+      @Override public boolean isShutdown (){ return false;}
+      @Override public boolean isTerminated (){ return false;}
+      @Override public boolean awaitTermination (long timeout, TimeUnit unit){return false;}
+      @SuppressWarnings("unchecked") @Override public <T> Future<T> submit (Callable<T> task){
+        processed.incrementAndGet();
+        try {
+          task.call();
+        } catch (Throwable e) {
+          throw new AssertionError(e);
+        }
+        return (Future<T>) DONE_FUTURE;
+      }
+      @Override public <T> Future<T> submit (Runnable task, T result){
+        throw new AssertionError("submit: "+task);
+      }
+      @Override public Future<?> submit (Runnable task){throw new AssertionError("submit: "+task);}
+      @Override public <T> List<Future<T>> invokeAll (Collection<? extends Callable<T>> tasks){
+        throw new AssertionError("invokeAll: "+tasks);
+      }
+      @Override public <T> List<Future<T>> invokeAll (Collection<? extends Callable<T>> tasks, long timeout, TimeUnit unit){
+        throw new AssertionError("invokeAll: "+tasks);
+      }
+      @Override public <T> T invokeAny (Collection<? extends Callable<T>> tasks){
+        throw new AssertionError("invokeAny: "+tasks);
+      }
+      @Override public <T> T invokeAny (Collection<? extends Callable<T>> tasks, long timeout, TimeUnit unit){
+        throw new AssertionError("invokeAny: "+tasks);
+      }
+      @Override public void execute (Runnable command){throw new AssertionError("execute: "+command);}
+    };
+
+    DelegatingScheduler ds = new DelegatingScheduler(main, es);
+    // task is the same = constant memory
+    final Callable<Object> businessTask = ()->42;
+
+    final long deadline = System.currentTimeMillis() + TIMEOUT;
+
+    final ScheduledFuture<?> sf0 = ds.schedule(businessTask, TIMEOUT, MILLISECONDS);
+    ScheduledFuture<?> sf = null;
+    for (int i=0; i<MAX-1; i++){
+      sf = ds.schedule(businessTask, deadline-System.currentTimeMillis(), MILLISECONDS);
+    }
+
+    int i = 0;
+    while (processed.get() < MAX){
+      if (i++ % 100 == 0) {
+        System.out.println(deadline - System.currentTimeMillis());
+        System.out.println("Q size: " + es.getQueue().size() + ", ActiveCount: " + es.getActiveCount() +
+            ", TaskCount: " + es.getTaskCount() + ", PoolSize: " + es.getPoolSize() + ", processed: " + processed);
+      }
+      Thread.sleep(20);// don't be noisy
+    }
+    long t = System.currentTimeMillis() - deadline;
+
+    assertEquals(processed.get(), MAX);//sf0+the rest
+    assertEquals(sf0.get(), 42);
+    assertTrue(sf0.isDone());
+    assertFalse(sf0.isCancelled());
+    assertSame(((DelegatingScheduler.ScheduledCompletableFuture<?>)sf0).delegate, DONE_FUTURE);
+    assertSame(((DelegatingScheduler.ScheduledCompletableFuture<?>)sf).delegate, DONE_FUTURE);
+
+    System.out.println("Total transfer time (ms): "+t);// Total transfer time (ms): 9851
+    System.out.println("Task/sec ~ "+(MAX*1000.0/t));// Task/sec ~ 507_563
   }
 }
